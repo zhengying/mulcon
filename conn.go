@@ -1,9 +1,8 @@
-package main
+package mulcon
 
 import (
 	"encoding/binary"
 	"fmt"
-	"log"
 	"net"
 	"sync"
 	"time"
@@ -191,7 +190,9 @@ func (l *localSession) Close() (err error) {
 	default:
 		close(l.die)
 	}
-	err = l.Conn.Close()
+	if l.Conn != nil {
+		err = l.Conn.Close()
+	}
 	return
 }
 
@@ -244,11 +245,11 @@ func (l *localSession) readOnce() (err error) {
 		if l.state == synackrecv {
 			l.starttime = time.Now()
 			l.state = establishing
-			log.Println("enter establishing state")
+			// log.Println("enter establishing state")
 		} else if l.state == establishing {
 			if time.Now().Sub(l.starttime) > time.Second*30 {
 				l.state = established
-				log.Println("enter established state")
+				// log.Println("enter established state")
 			}
 		} else {
 			return
@@ -259,12 +260,12 @@ func (l *localSession) readOnce() (err error) {
 	// log.Println(p.pktype)
 	if p.pktype == synack && (l.state == synsent || l.state == repsent) {
 		l.state = synackrecv
-		log.Println("enter synackrecv state")
+		// log.Println("enter synackrecv state")
 		if len(nop) != 0 {
 			l.local.lock.Lock()
 			if len(l.local.keystr) == 0 {
 				l.local.keystr = string(nop)
-				log.Println("get key str")
+				// log.Println("get key str")
 			}
 			l.local.lock.Unlock()
 		}
@@ -293,10 +294,20 @@ func (l *Local) Read(b []byte) (n int, err error) {
 	return
 }
 
+func (l *Local) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
+	n, err = l.Read(b)
+	addr = l.raddr
+	return
+}
+
+func (l *Local) WriteTo(b []byte, addr net.Addr) (n int, err error) {
+	return l.Write(b)
+}
+
 func (l *localSession) Write(b []byte) (n int, err error) {
 	// log.Println(l.state, synsent, synackrecv, establishing, established)
 	if l.state == established || l.state == establishing {
-		_, err = l.Conn.Write(b)
+		n, err = l.Conn.Write(b)
 		return
 	}
 	ivlen := l.getIvlen()
@@ -320,7 +331,8 @@ func (l *localSession) Write(b []byte) (n int, err error) {
 	p.encode(buf[ivlen:])
 	l.encrypt(buf[:hdrlen])
 	copy(buf[hdrlen:], b)
-	_, err = l.Conn.Write(buf)
+	n, err = l.Conn.Write(buf)
+	n -= hdrlen
 	return
 }
 
@@ -479,7 +491,9 @@ func (s *cipher) tryDecodePkt(b []byte) (p *pkt, nop []byte, payload []byte, err
 		err = fmt.Errorf("packet is too short")
 		return
 	}
-	d, dec, err := s.decrypt(b[:ivlen+pkthdrlen])
+	b2 := make([]byte, ivlen+pkthdrlen)
+	copy(b2, b)
+	d, dec, err := s.decrypt(b2)
 	if err != nil {
 		return
 	}
@@ -498,9 +512,9 @@ func (s *cipher) tryDecodePkt(b []byte) (p *pkt, nop []byte, payload []byte, err
 }
 
 func (s *Server) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
+	b2 := make([]byte, 2048)
 	for {
-		n, addr, err = s.PacketConn.ReadFrom(b)
-		// log.Println(n, addr, err)
+		n, addr, err = s.PacketConn.ReadFrom(b2)
 		if err != nil {
 			return
 		}
@@ -509,7 +523,7 @@ func (s *Server) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 		subsess, ok := s.subSessions[addrstr]
 		s.subSessionsLock.Unlock()
 		if !ok {
-			p, nop, payload, err1 := s.tryDecodePkt(b[:n])
+			p, nop, payload, err1 := s.tryDecodePkt(b2[:n])
 			if err1 != nil {
 				continue
 			}
@@ -570,6 +584,7 @@ func (s *Server) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 				s.subSessionsLock.Unlock()
 				sess.subsessions = append(sess.subsessions, subsess)
 				sess.lock.Unlock()
+				addr = subsess.LocalAddr()
 				return
 			} else {
 				continue
@@ -578,16 +593,19 @@ func (s *Server) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 		subsess.Flush()
 		addr = subsess.LocalAddr()
 		if subsess.state == established {
+			n = copy(b, b2[:n])
 			return
 		}
-		p, _, payload, err1 := s.tryDecodePkt(b[:n])
+		p, _, payload, err1 := s.tryDecodePkt(b2[:n])
 		if err1 != nil {
 			switch subsess.state {
 			case ackrecv:
+				n = copy(b, b2[:n])
 				subsess.state = establishing
 				subsess.starttime = time.Now()
 				return
 			case establishing:
+				n = copy(b, b2[:n])
 				if time.Now().Sub(subsess.starttime) > time.Second*30 {
 					subsess.state = established
 				}
@@ -596,7 +614,6 @@ func (s *Server) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 				continue
 			}
 		}
-		// log.Println("receive", p.pktype, syn, rep, synack, ack)
 		n = copy(b, payload)
 		switch p.pktype {
 		default:
@@ -610,7 +627,6 @@ func (s *Server) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 			return
 		}
 	}
-	return
 }
 
 func (s *Server) WriteTo(b []byte, addr net.Addr) (n int, err error) {
@@ -643,7 +659,8 @@ func (s *Server) WriteTo(b []byte, addr net.Addr) (n int, err error) {
 		copy(b2[ivlen+pkthdrlen:], []byte(subsess.sess.keystr))
 		s.encrypt(b2[:ivlen+pkthdrlen+p.noplen])
 		copy(b2[ivlen+pkthdrlen+p.noplen:], b)
-		n, err = s.PacketConn.WriteTo(b2, subsess.Addr())
+		_, err = s.PacketConn.WriteTo(b2, subsess.Addr())
+		n = len(b)
 		return
 	}
 	n, err = s.PacketConn.WriteTo(b, subsess.Addr())
