@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ccsexyz/utils"
@@ -122,10 +123,10 @@ type Local struct {
 	raddr         net.Addr
 	die           chan bool
 	readch        chan []byte
-	lock          sync.Mutex
+	lock          sync.RWMutex
 	localSessions []*localSession
 	ts            time.Time
-	rr            int
+	rr            int32
 	keystr        string
 	rtimer        *time.Timer
 	wtimer        *time.Timer
@@ -135,7 +136,7 @@ type Local struct {
 type localSession struct {
 	net.Conn
 	*cipher
-	lock      sync.Mutex
+	lock      sync.RWMutex
 	die       chan bool
 	local     *Local
 	ts        time.Time
@@ -262,12 +263,12 @@ func (l *localSession) readOnce() (err error) {
 		l.state = synackrecv
 		// log.Println("enter synackrecv state")
 		if len(nop) != 0 {
-			l.local.lock.Lock()
+			l.local.lock.RLock()
 			if len(l.local.keystr) == 0 {
 				l.local.keystr = string(nop)
 				// log.Println("get key str")
 			}
-			l.local.lock.Unlock()
+			l.local.lock.RUnlock()
 		}
 	}
 	err = l.dorecv(payload)
@@ -362,14 +363,14 @@ func (l *Local) tryDialNewConn(sess *localSession) {
 }
 
 func (l *Local) Write(b []byte) (n int, err error) {
-	l.lock.Lock()
-	l.rr++
+	rr := int(atomic.AddInt32(&l.rr, 1))
+	l.lock.RLock()
 	k := len(l.keystr) != 0
-	sess := l.localSessions[l.rr%len(l.localSessions)]
-	l.lock.Unlock()
-	sess.lock.Lock()
+	sess := l.localSessions[rr%len(l.localSessions)]
+	l.lock.RUnlock()
+	sess.lock.RLock()
 	state := sess.state
-	sess.lock.Unlock()
+	sess.lock.RUnlock()
 	if state == destroyed {
 		n, err = l.Write(b)
 		if k {
@@ -411,10 +412,10 @@ func (l *Local) SetDeadline(t time.Time) (err error) {
 
 type session struct {
 	addr        net.Addr
-	lock        sync.Mutex
+	lock        sync.RWMutex
 	subsessions []*subSession
 	ts          time.Time
-	rr          int
+	rr          int32
 	keystr      string
 }
 
@@ -460,11 +461,9 @@ type Server struct {
 	*cipher
 	lock            sync.Mutex
 	die             chan bool
-	sessions        map[string]*session
-	sessionsWithKey map[string]*session
-	sessionsLock    sync.Mutex
-	subSessions     map[string]*subSession
-	subSessionsLock sync.Mutex
+	sessions        sync.Map
+	sessionsWithKey sync.Map
+	subSessions     sync.Map
 	async           utils.AsyncRunner
 }
 
@@ -476,10 +475,7 @@ func Listen(conn net.PacketConn, method string, password string) (server *Server
 			password: password,
 			ivlen:    utils.GetIvLen(method),
 		},
-		die:             make(chan bool),
-		sessions:        make(map[string]*session),
-		sessionsWithKey: make(map[string]*session),
-		subSessions:     make(map[string]*subSession),
+		die: make(chan bool),
 	}
 	return
 }
@@ -519,9 +515,7 @@ func (s *Server) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 			return
 		}
 		addrstr := addr.String()
-		s.subSessionsLock.Lock()
-		subsess, ok := s.subSessions[addrstr]
-		s.subSessionsLock.Unlock()
+		v, ok := s.subSessions.Load(addrstr)
 		if !ok {
 			p, nop, payload, err1 := s.tryDecodePkt(b2[:n])
 			if err1 != nil {
@@ -533,55 +527,44 @@ func (s *Server) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 				subsess := &subSession{sess: sess, fresh: true, addr: addr, laddr: addr, state: synrecv}
 				sess.subsessions = []*subSession{subsess}
 				n = copy(b, payload)
-				s.subSessionsLock.Lock()
-				v, ok := s.subSessions[addrstr]
+				v, ok := s.subSessions.LoadOrStore(addrstr, subsess)
 				if ok {
-					s.subSessionsLock.Unlock()
-					addr = v.LocalAddr()
-					v.Flush()
+					subsess = v.(*subSession)
+					addr = subsess.LocalAddr()
+					subsess.Flush()
 					return
 				}
-				s.subSessions[addrstr] = subsess
-				s.subSessionsLock.Unlock()
-				s.sessionsLock.Lock()
-				s.sessions[addrstr] = sess
+				s.sessions.Store(addrstr, sess)
 				var keystr string
 				for {
 					keystr = string(utils.GetRandomBytes(sessionKeyLength))
-					_, ok = s.sessionsWithKey[keystr]
+					_, ok = s.sessionsWithKey.Load(keystr)
 					if !ok {
 						break
 					}
 				}
-				s.sessionsWithKey[keystr] = sess
-				s.sessionsLock.Unlock()
+				s.sessionsWithKey.Store(keystr, sess)
 				sess.keystr = keystr
 				return
 			} else if p.pktype == rep {
 				if len(nopstr) != sessionKeyLength {
 					continue
 				}
-				s.sessionsLock.Lock()
-				sess, ok := s.sessionsWithKey[nopstr]
+				v, ok = s.sessionsWithKey.Load(nopstr)
 				if !ok {
-					s.sessionsLock.Unlock()
 					continue
 				}
+				sess := v.(*session)
 				subsess := &subSession{sess: sess, fresh: true, addr: addr, laddr: sess.Addr(), state: synrecv}
 				n = copy(b, payload)
-				sess.lock.Lock()
-				s.sessionsLock.Unlock()
-				s.subSessionsLock.Lock()
-				v, ok := s.subSessions[addrstr]
+				v, ok = s.subSessions.LoadOrStore(addrstr, subsess)
 				if ok {
-					s.subSessionsLock.Unlock()
-					sess.lock.Unlock()
-					addr = v.LocalAddr()
-					v.Flush()
+					subsess = v.(*subSession)
+					addr = subsess.LocalAddr()
+					subsess.Flush()
 					return
 				}
-				s.subSessions[addrstr] = subsess
-				s.subSessionsLock.Unlock()
+				sess.lock.Lock()
 				sess.subsessions = append(sess.subsessions, subsess)
 				sess.lock.Unlock()
 				addr = subsess.LocalAddr()
@@ -590,6 +573,7 @@ func (s *Server) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 				continue
 			}
 		}
+		subsess := v.(*subSession)
 		subsess.Flush()
 		addr = subsess.LocalAddr()
 		if subsess.state == established {
@@ -631,23 +615,20 @@ func (s *Server) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 
 func (s *Server) WriteTo(b []byte, addr net.Addr) (n int, err error) {
 	addrstr := addr.String()
-	s.sessionsLock.Lock()
-	sess, ok := s.sessions[addrstr]
-	s.sessionsLock.Unlock()
+	v, ok := s.sessions.Load(addrstr)
 	if !ok {
 		return
 	}
-	sess.lock.Lock()
-	sess.rr++
+	sess := v.(*session)
+	rr := int(atomic.AddInt32(&sess.rr, 1))
+	sess.lock.RLock()
 	if len(sess.subsessions) == 0 {
-		sess.lock.Unlock()
-		s.sessionsLock.Lock()
-		delete(s.sessions, addrstr)
-		s.sessionsLock.Unlock()
+		sess.lock.RUnlock()
+		s.sessions.Delete(addrstr)
 		return
 	}
-	subsess := sess.subsessions[sess.rr%len(sess.subsessions)]
-	sess.lock.Unlock()
+	subsess := sess.subsessions[rr%len(sess.subsessions)]
+	sess.lock.RUnlock()
 	if subsess.state == synrecv {
 		ivlen := s.getIvlen()
 		var p pkt
