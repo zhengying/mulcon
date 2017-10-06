@@ -465,6 +465,8 @@ type Server struct {
 	sessionsWithKey sync.Map
 	subSessions     sync.Map
 	async           utils.AsyncRunner
+	mixed           bool
+	mixedCache      *utils.LRU
 }
 
 func Listen(conn net.PacketConn, method string, password string) (server *Server, err error) {
@@ -477,6 +479,25 @@ func Listen(conn net.PacketConn, method string, password string) (server *Server
 		},
 		die: make(chan bool),
 	}
+	return
+}
+
+func (s *Server) SetMixed(mixed bool) {
+	if !mixed {
+		if s.mixed {
+			s.mixed = false
+			s.mixedCache = nil
+		}
+		return
+	}
+
+	if s.mixed {
+		return
+	}
+
+	s.mixed = true
+	s.mixedCache = utils.NewLRU(6000, nil, nil)
+
 	return
 }
 
@@ -508,7 +529,7 @@ func (s *cipher) tryDecodePkt(b []byte) (p *pkt, nop []byte, payload []byte, err
 }
 
 func (s *Server) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
-	b2 := make([]byte, 2048)
+	b2 := b
 	for {
 		n, addr, err = s.PacketConn.ReadFrom(b2)
 		if err != nil {
@@ -517,8 +538,18 @@ func (s *Server) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 		addrstr := addr.String()
 		v, ok := s.subSessions.Load(addrstr)
 		if !ok {
+			if s.mixed {
+				_, ok = s.mixedCache.Load(addrstr)
+				if ok {
+					return
+				}
+			}
 			p, nop, payload, err1 := s.tryDecodePkt(b2[:n])
 			if err1 != nil {
+				if s.mixed {
+					s.mixedCache.Add(addrstr, nil)
+					return
+				}
 				continue
 			}
 			nopstr := string(nop)
@@ -577,19 +608,16 @@ func (s *Server) ReadFrom(b []byte) (n int, addr net.Addr, err error) {
 		subsess.Flush()
 		addr = subsess.LocalAddr()
 		if subsess.state == established {
-			n = copy(b, b2[:n])
 			return
 		}
 		p, _, payload, err1 := s.tryDecodePkt(b2[:n])
 		if err1 != nil {
 			switch subsess.state {
 			case ackrecv:
-				n = copy(b, b2[:n])
 				subsess.state = establishing
 				subsess.starttime = time.Now()
 				return
 			case establishing:
-				n = copy(b, b2[:n])
 				if time.Now().Sub(subsess.starttime) > time.Second*30 {
 					subsess.state = established
 				}
@@ -617,6 +645,12 @@ func (s *Server) WriteTo(b []byte, addr net.Addr) (n int, err error) {
 	addrstr := addr.String()
 	v, ok := s.sessions.Load(addrstr)
 	if !ok {
+		if s.mixed && s.mixedCache != nil {
+			ok = s.mixedCache.Has(addrstr)
+			if ok {
+				return s.PacketConn.WriteTo(b, addr)
+			}
+		}
 		return
 	}
 	sess := v.(*session)

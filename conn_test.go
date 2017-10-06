@@ -105,7 +105,7 @@ func TestSingleReadAndWrite(t *testing.T) {
 
 	localaddr := conn.LocalAddr().String()
 	buf := make([]byte, 1000)
-	rbuf := make([]byte, 1000)
+	rbuf := make([]byte, 2000)
 	for i := 0; i < 1000; i++ {
 		binary.Read(rand.Reader, binary.BigEndian, buf)
 		n, err := conn.Write(buf)
